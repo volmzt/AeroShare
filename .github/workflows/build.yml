@@ -1,0 +1,183 @@
+name: Build AERO SHARE
+
+# Builds the debug APK of AERO SHARE.
+#
+# Put AERO_SHARE_PROJECT.zip into the root of the repository (next to the .github folder). The workflow extracts it,
+# finds the Gradle project inside, runs the unit tests, builds app-debug.apk and uploads it as a build artifact.
+# If there is no ZIP, an already extracted Gradle project anywhere in the repository is used instead.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Unit tests and debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Optional: set the repository variable AERO_SUPPORT_URL (an http/https address) to show the "Support the developer"
+      # action in About. When it is not set the action is hidden.
+      AERO_SUPPORT_URL: ${{ vars.AERO_SUPPORT_URL }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Find and extract the project
+        id: locate
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          extract_dir="$GITHUB_WORKSPACE/_aero_extracted"
+          rm -rf "$extract_dir"
+          search_root="$GITHUB_WORKSPACE"
+
+          # 1) AERO_SHARE_PROJECT.zip in the repository root (any ZIP there that contains a Gradle wrapper is accepted too).
+          zip_file="$(find . -maxdepth 1 -type f -iname 'AERO_SHARE_PROJECT*.zip' | sort | head -n 1 || true)"
+          if [ -z "$zip_file" ]; then
+            for candidate in ./*.zip; do
+              [ -f "$candidate" ] || continue
+              if unzip -Z1 "$candidate" | grep -E '(^|/)gradlew$' > /dev/null; then
+                zip_file="$candidate"
+                break
+              fi
+            done
+          fi
+
+          if [ -n "$zip_file" ]; then
+            echo "Extracting $zip_file"
+            mkdir -p "$extract_dir"
+            unzip -q -o "$zip_file" -d "$extract_dir" -x '__MACOSX/*'
+            search_root="$extract_dir"
+          else
+            echo "No project ZIP in the repository root; looking for an extracted Gradle project in the repository."
+          fi
+
+          # 2) The Gradle project is the shallowest folder that has both a wrapper and a settings file.
+          project_dir=""
+          while IFS= read -r wrapper; do
+            dir="$(dirname "$wrapper")"
+            if [ -f "$dir/settings.gradle.kts" ] || [ -f "$dir/settings.gradle" ]; then
+              project_dir="$(cd "$dir" && pwd)"
+              break
+            fi
+          done < <(find "$search_root" -type f -name gradlew -not -path '*/.git/*' -not -path '*/__MACOSX/*' \
+                     | awk '{ print length($0) "\t" $0 }' | sort -n | cut -f2-)
+
+          if [ -z "$project_dir" ]; then
+            echo "::error::No Gradle project (gradlew + settings.gradle.kts) was found. Add AERO_SHARE_PROJECT.zip to the repository root."
+            exit 1
+          fi
+
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "Gradle project: $project_dir"
+          ls -la "$project_dir"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;34.0.0 build-tools;35.0.0'
+
+      - name: Show the environment
+        run: |
+          java -version
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          df -h . | tail -n 1
+
+      - name: Make the Gradle wrapper executable
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: chmod +x ./gradlew
+
+      - name: Validate the build (list Gradle tasks)
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          ./gradlew tasks --stacktrace 2>&1 | tee "$RUNNER_TEMP/logs/tasks.log"
+
+      # The tests must not hide a build result: they run first, a failure is reported at the end of the job,
+      # and the APK is still built and uploaded so that it can be tried while the failure is investigated.
+      - name: Run unit tests
+        id: tests
+        continue-on-error: true
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          ./gradlew :transfer:test :app:testDebugUnitTest --stacktrace --continue 2>&1 | tee "$RUNNER_TEMP/logs/tests.log"
+
+      - name: Build the debug APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          ./gradlew assembleDebug --stacktrace 2>&1 | tee "$RUNNER_TEMP/logs/assemble.log"
+
+      - name: Verify that app-debug.apk exists
+        id: apk
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        run: |
+          apk="$(find . -type f -path '*/build/outputs/apk/debug/*' -name 'app-debug.apk' | head -n 1)"
+          if [ -z "$apk" ]; then
+            echo "::error::app-debug.apk was not produced by assembleDebug"
+            find . -name '*.apk' -print || true
+            exit 1
+          fi
+          apk="$(realpath "$apk")"
+          echo "apk_path=$apk" >> "$GITHUB_OUTPUT"
+          ls -l "$apk"
+          {
+            echo "### AERO SHARE debug APK"
+            echo ""
+            echo "- File: \`app-debug.apk\` ($(du -h "$apk" | cut -f1))"
+            echo "- SHA-256: \`$(sha256sum "$apk" | cut -d' ' -f1)\`"
+            echo "- Build number: \`${GITHUB_RUN_NUMBER}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload app-debug.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: ${{ steps.apk.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload test reports
+        if: always() && steps.locate.outputs.project_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            ${{ steps.locate.outputs.project_dir }}/**/build/reports/tests
+            ${{ steps.locate.outputs.project_dir }}/**/build/test-results
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Fail the job when unit tests failed
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "::error::Unit tests failed. The APK was built and uploaded; see the test-reports and build-logs artifacts."
+          exit 1
